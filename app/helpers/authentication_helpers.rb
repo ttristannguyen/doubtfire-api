@@ -1,4 +1,6 @@
 require 'onelogin/ruby-saml'
+require 'keycloak_token_service'
+require 'securerandom'
 
 #
 # The AuthenticationHelpers include functions to check if the user
@@ -14,6 +16,8 @@ module AuthenticationHelpers
   # Reads details from the params fetched from the caller context.
   #
   def authenticated?(token_type = :general)
+    return authenticate_with_keycloak if keycloak_auth?
+
     auth_param = headers['auth-token'] || headers['Auth-Token'] || params['authToken'] || headers['Auth_Token'] || headers['auth_token'] || params['auth_token'] || params['Auth_Token']
     user_param = headers['username'] || headers['Username'] || params['username']
 
@@ -52,8 +56,99 @@ module AuthenticationHelpers
   # Get the current user either from warden or from the header
   #
   def current_user
-    username = headers['username'] || headers['Username'] || params['username']
-    User.eager_load(:role, :auth_tokens).find_by(username: username)
+    if keycloak_auth?
+      request.env['keycloak.user']
+    else
+      username = headers['username'] || headers['Username'] || params['username']
+      User.eager_load(:role, :auth_tokens).find_by(username: username)
+    end
+  end
+
+  def authenticate_with_keycloak
+    authorization_header = headers['Authorization'] || headers['authorization']
+    error!({ error: 'Authorization header missing.' }, 401) if authorization_header.blank?
+
+    scheme, token = authorization_header.split(' ')
+    unless scheme&.casecmp('Bearer')&.zero? && token.present?
+      error!({ error: 'Authorization header must use the Bearer scheme.' }, 401)
+    end
+
+    payload = KeycloakTokenService.instance.decode(token)
+    user = find_or_create_user_from_keycloak(payload)
+
+    request.env['keycloak.token'] = payload
+    request.env['keycloak.user'] = user
+    request.env['keycloak.roles'] = realm_roles_from_claims(payload)
+    request.env['keycloak.token_string'] = token
+
+    logger.info("Authenticated #{user.username} via Keycloak from #{request.ip}")
+    true
+  rescue KeycloakTokenService::VerificationError => e
+    logger.warn("Keycloak authentication failed: #{e.message}")
+    error!({ error: e.message }, e.status)
+  end
+
+  def find_or_create_user_from_keycloak(claims)
+    email = claims[:email] || claims[:preferred_username]
+    username = (claims[:preferred_username] || email)&.downcase
+    subject = claims[:sub]
+
+    if email.blank? || username.blank?
+      raise KeycloakTokenService::VerificationError.new('Token missing required identity claims.', 401)
+    end
+
+    user = User.eager_load(:role).find_by(email: email.downcase) ||
+           User.eager_load(:role).find_by(username: username) ||
+           User.new
+
+    given_name = claims[:given_name] || claims[:firstName] || user.first_name || 'First'
+    family_name = claims[:family_name] || claims[:lastName] || user.last_name || 'User'
+
+    user.first_name = given_name.titleize
+    user.last_name = family_name.titleize
+    user.email = email.downcase
+    user.username ||= username
+    user.nickname ||= claims[:preferred_username] || user.first_name
+    user.login_id ||= subject || email
+    user.role = map_role_from_claims(claims, user.role)
+
+    if user.encrypted_password.blank?
+      user.password = SecureRandom.hex(32)
+    end
+
+    if user.changed?
+      begin
+        user.save!
+      rescue ActiveRecord::RecordInvalid => e
+        raise KeycloakTokenService::VerificationError.new("Failed to persist Keycloak user profile: #{e.record.errors.full_messages.join(', ')}", 500)
+      end
+    end
+
+    user
+  end
+
+  def map_role_from_claims(claims, current_role)
+    roles = realm_roles_from_claims(claims)
+    priority = {
+      'admin' => Role.admin,
+      'auditor' => Role.auditor,
+      'convenor' => Role.convenor,
+      'tutor' => Role.tutor,
+      'student' => Role.student
+    }
+
+    matching_role = roles.find { |role| priority.key?(role) }
+    return current_role || Role.student if matching_role.nil?
+
+    priority[matching_role]
+  rescue => e
+    logger.warn("Failed to map Keycloak roles: #{e.message}")
+    current_role || Role.student
+  end
+
+  def realm_roles_from_claims(claims)
+    roles = Array(claims.dig(:realm_access, :roles))
+    roles.map { |role| role.to_s.sub(/^realm:/, '') }
   end
 
   #
@@ -61,6 +156,8 @@ module AuthenticationHelpers
   # Grape::API.
   #
   def add_auth_to(service)
+    return service if keycloak_auth?
+
     service.routes.each do |route|
       options = route.instance_variable_get('@options')
       next if options[:params]['Auth_Token']
@@ -130,5 +227,9 @@ module AuthenticationHelpers
   #
   def db_auth?
     Doubtfire::Application.config.auth_method == :database
+  end
+
+  def keycloak_auth?
+    Doubtfire::Application.config.auth_method == :keycloak
   end
 end

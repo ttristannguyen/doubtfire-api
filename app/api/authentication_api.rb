@@ -16,7 +16,7 @@ class AuthenticationApi < Grape::API
   #
   # Sign in - only mounted if AAF auth is NOT used
   #
-  if !AuthenticationHelpers.aaf_auth? && !AuthenticationHelpers.saml_auth?
+  if !AuthenticationHelpers.aaf_auth? && !AuthenticationHelpers.saml_auth? && !AuthenticationHelpers.keycloak_auth?
     desc 'Sign in'
     params do
       requires :username, type: String, desc: 'User username'
@@ -291,6 +291,15 @@ class AuthenticationApi < Grape::API
         Doubtfire::Application.config.saml[:idp_sso_signout_url]
       end
     present response, with: Grape::Presenters::Presenter
+  end
+
+  if AuthenticationHelpers.keycloak_auth?
+    desc 'Current user profile (Keycloak)'
+    get '/auth/me' do
+      authenticated?
+      present :user, current_user, with: Entities::UserEntity
+      present :realm_roles, request.env['keycloak.roles']
+    end
   end
 
   #

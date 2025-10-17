@@ -20,10 +20,10 @@ module Doubtfire
     Dotenv::Rails.load
 
     # ==> Authentication Method
-    # Authentication method default is database, but possible settings
-    # are: database, ldap, aaf, or saml. It can be overridden using the DF_AUTH_METHOD
+  # Authentication method default is database, but possible settings
+  # are: database, ldap, aaf, saml, or keycloak. It can be overridden using the DF_AUTH_METHOD
     # environment variable.
-    config.auth_method = (ENV['DF_AUTH_METHOD'] || :database).to_sym
+  config.auth_method = (ENV['DF_AUTH_METHOD'] || :database).to_sym
 
     # ==> Student work directory
     # File server location for storing student's work. Defaults to `student_work`
@@ -154,6 +154,21 @@ module Doubtfire
               "DF_SECRET_KEY_AAF            => #{!credentials.secret_key_aaf.nil?}\n"
       end
     end
+
+    if config.auth_method == :keycloak
+      config.keycloak = HashWithIndifferentAccess.new
+      config.keycloak[:realm] = ENV.fetch('KEYCLOAK_REALM', nil)
+      config.keycloak[:url] = ENV.fetch('KEYCLOAK_URL', nil)&.strip
+      config.keycloak[:audience] = ENV.fetch('KEYCLOAK_API_AUDIENCE', 'doubtfire-api')
+      config.keycloak[:public_key] = ENV['KEYCLOAK_PUBLIC_KEY']&.strip
+
+      if config.keycloak[:realm].blank? || config.keycloak[:url].blank?
+        raise "Invalid values specified to keycloak, check the following environment variables: \n  " \
+              "key                          => variable set?\n  " \
+              "KEYCLOAK_REALM               => #{!ENV['KEYCLOAK_REALM'].nil?}\n  " \
+              "KEYCLOAK_URL                 => #{!ENV['KEYCLOAK_URL'].nil?}\n"
+      end
+    end
     # Check secrets set for DF_SECRET_KEY_BASE, DF_SECRET_KEY_ATTR, DF_SECRET_KEY_DEVISE
     if credentials.secret_key_base.nil? ||
        credentials.secret_key_attr.nil? ||
@@ -194,10 +209,14 @@ module Doubtfire
       Rails.root.join('app/models/d2l')
 
     # CORS config
+    allowed_origins = ENV.fetch('CORS_ALLOWED_ORIGINS', '*').split(/\s*,\s*/)
     config.middleware.insert_before Warden::Manager, Rack::Cors do
       allow do
-        origins '*'
-        resource '*', headers: :any, methods: %i(get post put delete options)
+        origins(*allowed_origins)
+        resource '*',
+                 headers: :any,
+                 expose: %w(Authorization),
+                 methods: %i(get post put patch delete options head)
       end
     end
     # Generators for test framework
