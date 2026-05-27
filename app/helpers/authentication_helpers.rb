@@ -166,13 +166,13 @@ module AuthenticationHelpers
   # kc_idp_hint=google tells Keycloak to skip its login page and go straight to Google.
   #
   def keycloak_auth_url(redirect_uri:, state:)
+    # To force the Google account picker even when the user already has an active Google
+    # session, add "&prompt=select_account" before the redirect_uri param.
     "#{keycloak_config[:public_url]}/realms/#{keycloak_config[:realm]}/protocol/openid-connect/auth" \
     "?client_id=#{keycloak_config[:client_id]}" \
     "&response_type=code" \
     "&scope=openid+email+profile" \
     "&kc_idp_hint=google" \
-    # Add "&prompt=select_account" here to force the Google account picker even when
-    # the user already has an active Google session in the browser.
     "&redirect_uri=#{CGI.escape(redirect_uri)}" \
     "&state=#{CGI.escape(state)}"
   end

@@ -1,4 +1,7 @@
 require 'test_helper'
+require 'minitest/mock'
+require 'uri'
+require 'cgi'
 
 class AuthTest < ActiveSupport::TestCase
   include Rack::Test::Methods
@@ -9,6 +12,47 @@ class AuthTest < ActiveSupport::TestCase
     Rails.application
   end
 
+  def decoded_query_param(url, key)
+    query = URI.parse(url).query
+    CGI.parse(query).fetch(key).first
+  end
+
+  def assert_keycloak_state(state, expected_mode, expected_user_id = nil)
+    claims = AuthenticationHelpers.verify_oauth_state(state)
+    assert claims, 'Expected OAuth state JWT to verify'
+    assert_equal expected_mode, claims['mode']
+    assert_equal expected_user_id, claims['user_id'] if expected_user_id
+    assert claims['exp'] > Time.zone.now.to_i
+    assert claims['jti'].present?
+  end
+
+  def stub_keycloak_token_exchange(id_token = 'verified-id-token')
+    stub_request(:post, 'http://keycloak.test/realms/doubtfire/protocol/openid-connect/token')
+      .with(body: hash_including(
+        'grant_type' => 'authorization_code',
+        'client_id' => 'doubtfire-api',
+        'client_secret' => 'test-client-secret'
+      ))
+      .to_return(
+        status: 200,
+        body: { id_token: id_token }.to_json,
+        headers: { 'Content-Type' => 'application/json' }
+      )
+  end
+
+  # Stubs the AuthenticationHelpers#verify_keycloak_id_token INSTANCE method so
+  # that Grape endpoints (which call the private instance version via `helpers`)
+  # receive the given claims hash instead of performing a real JWKS fetch.
+  # Minitest's built-in `stub` only patches the module-level (singleton) method,
+  # so we patch the module's instance method directly and restore on exit.
+  def stub_keycloak_id_token(claims)
+    original = AuthenticationHelpers.instance_method(:verify_keycloak_id_token)
+    AuthenticationHelpers.send(:define_method, :verify_keycloak_id_token) { |_token| claims }
+    yield
+  ensure
+    AuthenticationHelpers.send(:define_method, :verify_keycloak_id_token, original)
+  end
+
   # --------------------------------------------------------------------------- #
   # --- Endpoint testing for:
   # ------- /api/auth.json
@@ -16,6 +60,120 @@ class AuthTest < ActiveSupport::TestCase
 
   # --------------------------------------------------------------------------- #
   # POST tests
+
+  def test_auth_method_exposes_keycloak_google_signin_when_configured
+    get '/api/auth/method'
+
+    assert_equal 200, last_response.status
+    assert_equal true, last_response_body['google_signin_enabled']
+  end
+
+  def test_keycloak_google_signin_start_returns_google_broker_url
+    get '/api/auth/google'
+
+    assert_equal 200, last_response.status
+    signin_url = last_response_body['signin_url']
+
+    assert_match %r{\Ahttp://localhost:8080/realms/doubtfire/protocol/openid-connect/auth}, signin_url
+    assert_equal 'doubtfire-api', decoded_query_param(signin_url, 'client_id')
+    assert_equal 'code', decoded_query_param(signin_url, 'response_type')
+    assert_equal 'google', decoded_query_param(signin_url, 'kc_idp_hint')
+    assert_equal 'http://localhost:3000/api/auth/google/callback', decoded_query_param(signin_url, 'redirect_uri')
+    assert_keycloak_state decoded_query_param(signin_url, 'state'), 'signin'
+  end
+
+  def test_keycloak_google_link_start_requires_authenticated_user_and_sets_link_state
+    user = FactoryBot.create(:user)
+    add_auth_header_for(user: user)
+
+    get '/api/auth/link/google'
+
+    assert_equal 200, last_response.status
+    link_url = last_response_body['link_url']
+
+    assert_match %r{\Ahttp://localhost:8080/realms/doubtfire/protocol/openid-connect/auth}, link_url
+    assert_equal 'google', decoded_query_param(link_url, 'kc_idp_hint')
+    assert_equal 'http://localhost:3000/api/auth/link/callback', decoded_query_param(link_url, 'redirect_uri')
+    assert_keycloak_state decoded_query_param(link_url, 'state'), 'link', user.id
+  end
+
+  def test_keycloak_google_signin_callback_uses_linked_login_and_issues_one_time_token
+    user = FactoryBot.create(:user, username: 'linked-google-user')
+    UserLinkedLogin.create!(
+      user: user,
+      provider: 'google',
+      provider_identifier: 'linked@example.com'
+    )
+
+    state = AuthenticationHelpers.generate_oauth_state(mode: 'signin')
+    stub_keycloak_token_exchange
+    stub_keycloak_id_token({ 'email' => 'linked@example.com' }) do
+      get "/api/auth/google/callback?code=abc123&state=#{CGI.escape(state)}"
+    end
+
+    assert_equal 302, last_response.status
+    redirect = last_response.headers['Location']
+    assert_match %r{/sign_in\?}, redirect
+    assert_equal user.username, decoded_query_param(redirect, 'username')
+
+    login_token = decoded_query_param(redirect, 'authToken')
+    assert user.token_for_text?(login_token, :login), 'Expected callback to create a temporary login token'
+  end
+
+  def test_keycloak_google_signin_callback_rejects_unlinked_google_account
+    state = AuthenticationHelpers.generate_oauth_state(mode: 'signin')
+    stub_keycloak_token_exchange
+    stub_keycloak_id_token({ 'email' => 'unlinked@example.com' }) do
+      get "/api/auth/google/callback?code=abc123&state=#{CGI.escape(state)}"
+    end
+
+    assert_equal 302, last_response.status
+    redirect = last_response.headers['Location']
+    assert_equal 'no_linked_account', decoded_query_param(redirect, 'error')
+    refute UserLinkedLogin.exists?(provider: 'google', provider_identifier: 'unlinked@example.com')
+  end
+
+  def test_keycloak_google_link_callback_records_linked_login
+    user = FactoryBot.create(:user)
+    state = AuthenticationHelpers.generate_oauth_state(mode: 'link', user_id: user.id)
+    stub_keycloak_token_exchange
+
+    stub_keycloak_id_token({ 'email' => 'new-link@example.com' }) do
+      get "/api/auth/link/callback?code=abc123&state=#{CGI.escape(state)}"
+    end
+
+    assert_equal 302, last_response.status
+    assert_equal 'google', decoded_query_param(last_response.headers['Location'], 'linked')
+    assert UserLinkedLogin.exists?(
+      user: user,
+      provider: 'google',
+      provider_identifier: 'new-link@example.com'
+    )
+  end
+
+  def test_keycloak_google_link_callback_rejects_provider_identifier_already_linked_elsewhere
+    first_user = FactoryBot.create(:user)
+    second_user = FactoryBot.create(:user)
+    UserLinkedLogin.create!(
+      user: first_user,
+      provider: 'google',
+      provider_identifier: 'existing-link@example.com'
+    )
+    state = AuthenticationHelpers.generate_oauth_state(mode: 'link', user_id: second_user.id)
+    stub_keycloak_token_exchange
+
+    stub_keycloak_id_token({ 'email' => 'existing-link@example.com' }) do
+      get "/api/auth/link/callback?code=abc123&state=#{CGI.escape(state)}"
+    end
+
+    assert_equal 302, last_response.status
+    assert_equal 'already_linked', decoded_query_param(last_response.headers['Location'], 'link_error')
+    refute UserLinkedLogin.exists?(
+      user: second_user,
+      provider: 'google',
+      provider_identifier: 'existing-link@example.com'
+    )
+  end
 
   # Test POST for new authentication token
   def test_auth_post

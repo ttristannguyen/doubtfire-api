@@ -113,6 +113,71 @@ class UnitsTest < ActiveSupport::TestCase
     }
   end
 
+  def test_get_linked_logins_for_current_user
+    user = FactoryBot.create(:user)
+    linked_login = UserLinkedLogin.create!(
+      user: user,
+      provider: 'google',
+      provider_identifier: 'student.personal@example.com'
+    )
+
+    add_auth_header_for(user: user)
+    get "/api/users/#{user.id}/linked_logins"
+
+    assert_equal 200, last_response.status
+    assert_equal 1, last_response_body.length
+    assert_equal linked_login.provider, last_response_body.first['provider']
+    assert_equal linked_login.provider_identifier, last_response_body.first['provider_identifier']
+    assert last_response_body.first['created_at'].present?
+  end
+
+  def test_get_linked_logins_rejects_other_student
+    owner = FactoryBot.create(:user)
+    other = FactoryBot.create(:user)
+    UserLinkedLogin.create!(
+      user: owner,
+      provider: 'google',
+      provider_identifier: 'student.personal@example.com'
+    )
+
+    add_auth_header_for(user: other)
+    get "/api/users/#{owner.id}/linked_logins"
+
+    assert_equal 403, last_response.status
+    assert last_response_body.key?('error')
+  end
+
+  def test_delete_linked_login_for_current_user
+    user = FactoryBot.create(:user)
+    UserLinkedLogin.create!(
+      user: user,
+      provider: 'google',
+      provider_identifier: 'student.personal@example.com'
+    )
+
+    add_auth_header_for(user: user)
+    delete_json "/api/users/#{user.id}/linked_logins/google"
+
+    assert_equal 204, last_response.status
+    refute UserLinkedLogin.exists?(user: user, provider: 'google')
+  end
+
+  def test_delete_linked_login_rejects_other_user
+    owner = FactoryBot.create(:user)
+    other = FactoryBot.create(:user)
+    UserLinkedLogin.create!(
+      user: owner,
+      provider: 'google',
+      provider_identifier: 'student.personal@example.com'
+    )
+
+    add_auth_header_for(user: other)
+    delete_json "/api/users/#{owner.id}/linked_logins/google"
+
+    assert_equal 403, last_response.status
+    assert UserLinkedLogin.exists?(user: owner, provider: 'google')
+  end
+
   # ========================================================================
   # POST tests
   # ========================================================================
